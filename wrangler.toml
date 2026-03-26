@@ -1,0 +1,23 @@
+name = "echo-finance"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[triggers]
+crons = ["0 6 * * *", "0 0 1 * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-finance"
+database_id = "b01369a2-3881-48cb-8779-0a85203acce9"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "56a60a2d674c4fa3a9ca60edd20048a8"
+
+[[services]]
+binding = "ENGINE_RUNTIME"
+service = "echo-engine-runtime"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
