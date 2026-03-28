@@ -382,6 +382,19 @@ app.get('/dashboard', async (c) => {
   return json({ total_balance: totalBalance, accounts: accounts.results, recent_transactions: recentTx.results, upcoming_recurring: upcomingRecurring.results, goals: goals.results.map((g: any) => ({ ...g, progress: g.target_amount > 0 ? Math.round((g.current_amount / g.target_amount) * 100) : 0 })) });
 });
 
+
+app.onError((err, c) => {
+  if (err.message?.includes('JSON')) {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+  console.error(`[echo-finance] ${err.message}`);
+  return c.json({ error: 'Internal server error' }, 500);
+});
+
+app.notFound((c) => {
+  return c.json({ error: 'Not found' }, 404);
+});
+
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
