@@ -17,7 +17,7 @@ interface Env {
 }
 
 const app = new Hono<{ Bindings: Env }>();
-app.use('*', cors({ origin: '*', allowMethods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowHeaders: ['Content-Type','Authorization','X-Tenant-ID','X-Echo-API-Key'] }));
+app.use('*', cors({ origin: ['https://echo-ept.com','https://www.echo-ept.com','https://echo-op.com','https://www.echo-op.com','http://localhost:3000','http://localhost:3001'], allowMethods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'], allowHeaders: ['Content-Type','Authorization','X-Tenant-ID','X-Echo-API-Key'] }));
 
 const uid = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
@@ -76,7 +76,7 @@ app.get('/health', async (c) => {
 app.get('/status', async (c) => {
   const counts = await c.env.DB.prepare(`SELECT
     (SELECT COUNT(*) FROM accounts) as accounts,
-    (SELECT COUNT(*) FROM transactions) as transactions,
+    (SELECT COUNT(*) FROM transactions WHERE deleted_at IS NULL) as transactions,
     (SELECT COUNT(*) FROM budgets) as budgets,
     (SELECT COUNT(*) FROM goals) as goals,
     (SELECT COUNT(*) FROM recurring) as recurring_payments,
@@ -135,7 +135,7 @@ app.get('/transactions', async (c) => {
   const limit = Math.min(parseInt(c.req.query('limit') || '50'), 200);
   const offset = parseInt(c.req.query('offset') || '0');
 
-  let q = 'SELECT t.*, a.name as account_name FROM transactions t LEFT JOIN accounts a ON a.id=t.account_id WHERE t.tenant_id=?';
+  let q = 'SELECT t.*, a.name as account_name FROM transactions t LEFT JOIN accounts a ON a.id=t.account_id WHERE t.tenant_id=? AND t.deleted_at IS NULL';
   const params: (string | number)[] = [t];
 
   if (accountId) { q += ' AND t.account_id=?'; params.push(accountId); }
@@ -169,26 +169,30 @@ app.post('/transactions', async (c) => {
 });
 
 app.get('/transactions/:id', async (c) => {
-  const r = await c.env.DB.prepare('SELECT * FROM transactions WHERE id=? AND tenant_id=?').bind(c.req.param('id'), tid(c)).first();
+  const r = await c.env.DB.prepare('SELECT * FROM transactions WHERE id=? AND tenant_id=? AND deleted_at IS NULL').bind(c.req.param('id'), tid(c)).first();
   return r ? json(r) : json({ error: 'Not found' }, 404);
 });
 
 app.put('/transactions/:id', async (c) => {
   const b = sanitizeBody(await c.req.json());
-  await c.env.DB.prepare("UPDATE transactions SET category=coalesce(?,category), subcategory=coalesce(?,subcategory), description=coalesce(?,description), payee=coalesce(?,payee), tags=coalesce(?,tags), updated_at=datetime('now') WHERE id=? AND tenant_id=?")
+  await c.env.DB.prepare("UPDATE transactions SET category=coalesce(?,category), subcategory=coalesce(?,subcategory), description=coalesce(?,description), payee=coalesce(?,payee), tags=coalesce(?,tags), updated_at=datetime('now') WHERE id=? AND tenant_id=? AND deleted_at IS NULL")
     .bind(b.category || null, b.subcategory || null, b.description || null, b.payee || null, b.tags || null, c.req.param('id'), tid(c)).run();
   return json({ updated: true });
 });
 
 app.delete('/transactions/:id', async (c) => {
   const t = tid(c); const txId = c.req.param('id');
+  // Soft-delete: SET deleted_at instead of hard DELETE to prevent race with concurrent report reads
+  const deleteResult = await c.env.DB.prepare(
+    "UPDATE transactions SET deleted_at=datetime('now') WHERE id=? AND tenant_id=? AND deleted_at IS NULL"
+  ).bind(txId, t).run();
+  if (!deleteResult.meta.changes) return json({ error: 'Not found' }, 404);
+  // Reverse account balance after confirmed soft-delete
   const tx = await c.env.DB.prepare('SELECT amount, account_id FROM transactions WHERE id=? AND tenant_id=?').bind(txId, t).first() as any;
-  if (!tx) return json({ error: 'Not found' }, 404);
-  if (tx.account_id) {
+  if (tx?.account_id) {
     await c.env.DB.prepare("UPDATE accounts SET balance=balance-?, updated_at=datetime('now') WHERE id=? AND tenant_id=?")
       .bind(tx.amount, tx.account_id, t).run();
   }
-  await c.env.DB.prepare('DELETE FROM transactions WHERE id=? AND tenant_id=?').bind(txId, t).run();
   return json({ deleted: true });
 });
 
@@ -200,7 +204,7 @@ app.get('/budgets', async (c) => {
   // Calculate spent for each budget
   const enriched = [];
   for (const budget of r.results as any[]) {
-    const spent = await c.env.DB.prepare("SELECT COALESCE(SUM(ABS(amount)),0) as total FROM transactions WHERE tenant_id=? AND category=? AND tx_type='expense' AND tx_date>=? AND tx_date<=?")
+    const spent = await c.env.DB.prepare("SELECT COALESCE(SUM(ABS(amount)),0) as total FROM transactions WHERE tenant_id=? AND category=? AND tx_type='expense' AND tx_date>=? AND tx_date<=? AND deleted_at IS NULL")
       .bind(t, budget.category, budget.period_start, budget.period_end).first() as any;
     enriched.push({ ...budget, spent: spent?.total || 0, remaining: budget.amount - (spent?.total || 0), percent_used: Math.round(((spent?.total || 0) / budget.amount) * 100) });
   }
@@ -282,9 +286,9 @@ app.get('/reports/summary', async (c) => {
   const from = c.req.query('from') || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
   const to = c.req.query('to') || now().split('T')[0];
 
-  const income = await c.env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE tenant_id=? AND tx_type='income' AND tx_date>=? AND tx_date<=?").bind(t, from, to).first() as any;
-  const expenses = await c.env.DB.prepare("SELECT COALESCE(SUM(ABS(amount)),0) as total FROM transactions WHERE tenant_id=? AND tx_type='expense' AND tx_date>=? AND tx_date<=?").bind(t, from, to).first() as any;
-  const txCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM transactions WHERE tenant_id=? AND tx_date>=? AND tx_date<=?").bind(t, from, to).first() as any;
+  const income = await c.env.DB.prepare("SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE tenant_id=? AND tx_type='income' AND tx_date>=? AND tx_date<=? AND deleted_at IS NULL").bind(t, from, to).first() as any;
+  const expenses = await c.env.DB.prepare("SELECT COALESCE(SUM(ABS(amount)),0) as total FROM transactions WHERE tenant_id=? AND tx_type='expense' AND tx_date>=? AND tx_date<=? AND deleted_at IS NULL").bind(t, from, to).first() as any;
+  const txCount = await c.env.DB.prepare("SELECT COUNT(*) as cnt FROM transactions WHERE tenant_id=? AND tx_date>=? AND tx_date<=? AND deleted_at IS NULL").bind(t, from, to).first() as any;
   const totalBalance = await c.env.DB.prepare("SELECT COALESCE(SUM(balance),0) as total FROM accounts WHERE tenant_id=? AND is_active=1").bind(t).first() as any;
 
   return json({
@@ -303,7 +307,7 @@ app.get('/reports/by-category', async (c) => {
   const from = c.req.query('from') || new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
   const to = c.req.query('to') || now().split('T')[0];
 
-  const r = await c.env.DB.prepare("SELECT category, tx_type, COALESCE(SUM(ABS(amount)),0) as total, COUNT(*) as count FROM transactions WHERE tenant_id=? AND tx_date>=? AND tx_date<=? GROUP BY category, tx_type ORDER BY total DESC")
+  const r = await c.env.DB.prepare("SELECT category, tx_type, COALESCE(SUM(ABS(amount)),0) as total, COUNT(*) as count FROM transactions WHERE tenant_id=? AND tx_date>=? AND tx_date<=? AND deleted_at IS NULL GROUP BY category, tx_type ORDER BY total DESC")
     .bind(t, from, to).all();
   return json({ period: { from, to }, categories: r.results });
 });
@@ -316,7 +320,7 @@ app.get('/reports/monthly-trend', async (c) => {
       SUM(CASE WHEN tx_type='income' THEN amount ELSE 0 END) as income,
       SUM(CASE WHEN tx_type='expense' THEN ABS(amount) ELSE 0 END) as expenses,
       COUNT(*) as transactions
-    FROM transactions WHERE tenant_id=? AND tx_date >= date('now', '-' || ? || ' months')
+    FROM transactions WHERE tenant_id=? AND tx_date >= date('now', '-' || ? || ' months') AND deleted_at IS NULL
     GROUP BY month ORDER BY month
   `).bind(t, months).all();
   return json(r.results);
@@ -325,7 +329,7 @@ app.get('/reports/monthly-trend', async (c) => {
 // ═══════════════ AI CATEGORIZE ═══════════════
 app.post('/transactions/:id/categorize', async (c) => {
   const t = tid(c); const txId = c.req.param('id');
-  const tx = await c.env.DB.prepare('SELECT * FROM transactions WHERE id=? AND tenant_id=?').bind(txId, t).first() as any;
+  const tx = await c.env.DB.prepare('SELECT * FROM transactions WHERE id=? AND tenant_id=? AND deleted_at IS NULL').bind(txId, t).first() as any;
   if (!tx) return json({ error: 'Not found' }, 404);
 
   try {
@@ -342,7 +346,7 @@ app.post('/transactions/:id/categorize', async (c) => {
     let cat = { category: 'other', subcategory: null as string | null, confidence: 0 };
     try { cat = JSON.parse(answer); } catch {}
 
-    await c.env.DB.prepare("UPDATE transactions SET category=?, subcategory=?, updated_at=datetime('now') WHERE id=?")
+    await c.env.DB.prepare("UPDATE transactions SET category=?, subcategory=?, updated_at=datetime('now') WHERE id=? AND deleted_at IS NULL")
       .bind(cat.category, cat.subcategory, txId).run();
     return json(cat);
   } catch (e: any) {
@@ -352,7 +356,7 @@ app.post('/transactions/:id/categorize', async (c) => {
 
 app.post('/insights', async (c) => {
   const t = tid(c);
-  const summary = await c.env.DB.prepare("SELECT tx_type, category, SUM(ABS(amount)) as total FROM transactions WHERE tenant_id=? AND tx_date >= date('now','-30 days') GROUP BY tx_type, category ORDER BY total DESC LIMIT 20").bind(t).all();
+  const summary = await c.env.DB.prepare("SELECT tx_type, category, SUM(ABS(amount)) as total FROM transactions WHERE tenant_id=? AND tx_date >= date('now','-30 days') AND deleted_at IS NULL GROUP BY tx_type, category ORDER BY total DESC LIMIT 20").bind(t).all();
 
   try {
     const resp = await c.env.ENGINE_RUNTIME.fetch('https://engine-runtime/query', {
@@ -377,7 +381,7 @@ app.post('/insights', async (c) => {
 app.get('/dashboard', async (c) => {
   const t = tid(c);
   const accounts = await c.env.DB.prepare('SELECT id, name, account_type, balance, currency FROM accounts WHERE tenant_id=? AND is_active=1 ORDER BY balance DESC').bind(t).all();
-  const recentTx = await c.env.DB.prepare('SELECT t.id, t.amount, t.tx_type, t.category, t.description, t.payee, t.tx_date, a.name as account_name FROM transactions t LEFT JOIN accounts a ON a.id=t.account_id WHERE t.tenant_id=? ORDER BY t.tx_date DESC, t.created_at DESC LIMIT 10').bind(t).all();
+  const recentTx = await c.env.DB.prepare('SELECT t.id, t.amount, t.tx_type, t.category, t.description, t.payee, t.tx_date, a.name as account_name FROM transactions t LEFT JOIN accounts a ON a.id=t.account_id WHERE t.tenant_id=? AND t.deleted_at IS NULL ORDER BY t.tx_date DESC, t.created_at DESC LIMIT 10').bind(t).all();
   const upcomingRecurring = await c.env.DB.prepare("SELECT * FROM recurring WHERE tenant_id=? AND is_active=1 AND next_date <= date('now','+7 days') ORDER BY next_date LIMIT 5").bind(t).all();
   const goals = await c.env.DB.prepare('SELECT id, name, target_amount, current_amount, target_date FROM goals WHERE tenant_id=? AND status=? ORDER BY target_date LIMIT 5').bind(t, 'active').all();
   const totalBalance = accounts.results.reduce((sum: number, a: any) => sum + (a.balance || 0), 0);
