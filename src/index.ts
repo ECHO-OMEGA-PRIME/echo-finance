@@ -63,6 +63,9 @@ app.use('*', async (c, next) => {
   return next();
 });
 
+// ═══════════════ ROOT ═══════════════
+app.get('/', (c) => json({ service: 'echo-finance', version: '1.0.0', status: 'operational' }));
+
 // ═══════════════ HEALTH ═══════════════
 app.get('/health', async (c) => {
   let dbOk = false;
